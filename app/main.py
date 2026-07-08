@@ -1,0 +1,76 @@
+"""FastAPI app — the OpenAI-compatible gateway surface."""
+from __future__ import annotations
+
+from fastapi import FastAPI
+
+from . import __version__
+from .metrics import STORE
+from .providers import Message, get_provider
+from .routing import route
+from .schemas import (
+    ChatCompletionRequest,
+    ChatCompletionResponse,
+    Choice,
+    ChatMessage,
+    RouterAIMeta,
+    Usage,
+)
+
+app = FastAPI(
+    title="routerai",
+    version=__version__,
+    description="Cost-aware, quality-gated LLM routing gateway (govern control-plane).",
+)
+
+
+@app.get("/")
+def root():
+    return {
+        "name": "routerai",
+        "version": __version__,
+        "provider": get_provider().name,
+        "endpoints": ["/v1/chat/completions", "/metrics", "/health"],
+    }
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
+    messages = [Message(role=m.role, content=m.content) for m in req.messages]
+    # a model hint like "cheap"/"balanced"/"premium" is honored as a tier
+    tier_hint = req.quality_tier or req.model
+
+    result = route(messages, quality_tier=tier_hint)
+
+    return ChatCompletionResponse(
+        model=result.chosen_model,
+        choices=[
+            Choice(
+                message=ChatMessage(role="assistant", content=result.completion.text),
+            )
+        ],
+        usage=Usage(
+            prompt_tokens=result.completion.prompt_tokens,
+            completion_tokens=result.completion.completion_tokens,
+            total_tokens=result.completion.total_tokens,
+        ),
+        routerai=RouterAIMeta(
+            request_id=result.request_id,
+            tier=result.tier,
+            chosen_model=result.chosen_model,
+            est_cost_usd=result.est_cost,
+            baseline_cost_usd=result.baseline_cost,
+            est_savings_usd=round(result.baseline_cost - result.est_cost, 8),
+            eval_score=result.eval_score,
+            passed_quality_bar=result.passed_quality_bar,
+        ),
+    )
+
+
+@app.get("/metrics")
+def metrics():
+    return STORE.summary()

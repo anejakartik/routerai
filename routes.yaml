@@ -1,0 +1,47 @@
+# routerai routing policy
+#
+# Each "tier" maps a quality-tier / model-hint to an ordered list of candidate
+# models. The router picks the CHEAPEST candidate whose tier matches the request,
+# then (in shadow mode) checks that the cheap route still clears the quality bar.
+#
+# cost is expressed in USD per 1K tokens (rough public list-price approximations;
+# override freely for your own contracts).
+#
+# The `baseline` model is what a naive "always use the premium model" setup would
+# have used — used to compute estimated savings on /metrics.
+
+baseline: gpt-4o
+
+# Minimum eval score (0.0 - 1.0) a cheap route must clear to be considered
+# "quality-passing". Below this, the decision log flags a potential regression.
+quality_bar: 0.5
+
+# Fraction of requests to shadow-evaluate (1.0 = every request). v0.1 evaluates
+# all requests for a rich demo; lower this in production.
+shadow_sample_rate: 1.0
+
+models:
+  # model_name: cost per 1K tokens (USD)
+  gpt-4o: 0.0050
+  gpt-4o-mini: 0.0003
+  claude-3-5-sonnet: 0.0060
+  claude-3-5-haiku: 0.0010
+  stub-small: 0.0002
+  stub-large: 0.0040
+
+# quality tier -> ordered candidate models (router picks the cheapest of these)
+tiers:
+  cheap:
+    - stub-small
+    - gpt-4o-mini
+  balanced:
+    - stub-small
+    - gpt-4o-mini
+    - claude-3-5-haiku
+  premium:
+    - stub-large
+    - claude-3-5-sonnet
+    - gpt-4o
+
+# fallback tier used when the request does not specify one (see routing.classify)
+default_tier: balanced
