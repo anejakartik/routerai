@@ -1,12 +1,15 @@
 """FastAPI app — the OpenAI-compatible gateway surface."""
 from __future__ import annotations
 
+import logging
+
 from fastapi import FastAPI
 
 from . import __version__
 from .metrics import STORE
+from .observability import get_sink
 from .providers import Message, get_provider
-from .routing import route
+from .routing import get_db, route
 from .schemas import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -16,11 +19,28 @@ from .schemas import (
     Usage,
 )
 
+logger = logging.getLogger("routerai.main")
+
 app = FastAPI(
     title="routerai",
     version=__version__,
     description="Cost-aware, quality-gated LLM routing gateway (govern control-plane).",
 )
+
+
+@app.on_event("startup")
+def _reload_persisted_metrics() -> None:
+    """Warm the in-memory metrics view from the durable SQLite log on startup."""
+    try:
+        db = get_db()
+        persisted = db.load_all()
+        if persisted:
+            STORE.reset()
+            for d in persisted:
+                STORE.record(d)
+            logger.info("reloaded %d persisted decision(s) into metrics", len(persisted))
+    except Exception as err:  # noqa: BLE001 - never block startup on the log
+        logger.warning("could not reload persisted metrics: %s", err)
 
 
 @app.get("/")
@@ -29,6 +49,7 @@ def root():
         "name": "routerai",
         "version": __version__,
         "provider": get_provider().name,
+        "event_sink": getattr(get_sink(), "name", "unknown"),
         "endpoints": ["/v1/chat/completions", "/metrics", "/health"],
     }
 

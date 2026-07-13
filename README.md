@@ -61,11 +61,19 @@ eval score).
    candidate model** for that tier from `routes.yaml`.
 3. **Providers** — a pluggable abstraction. Ships with a **stub** provider so it
    runs offline with no key; set `ROUTERAI_PROVIDER=openai` (+ `OPENAI_API_KEY`)
-   to use a real backend.
+   or `ROUTERAI_PROVIDER=anthropic` (+ `ANTHROPIC_API_KEY`) to use a real backend.
+   Real adapters enforce a timeout, retry once, and **fall back to the stub** on
+   error so a provider outage degrades to offline mode instead of a 500 (v0.2).
 4. **Shadow eval** — a pluggable `evaluate(prompt, response) -> score` judge
    scores each response and flags whether the cheap route cleared the
    `quality_bar` (v0.1 uses a heuristic judge; swap in an evalstack/LLM judge).
-5. **Metrics** — `GET /metrics` returns total requests, tokens, est cost,
+5. **Persistence** — every decision is appended to **SQLite** (`routerai.db`) and
+   mirrored in an in-memory view; on startup the aggregate metrics are reloaded
+   from the log so `/metrics` is continuous across restarts (v0.2).
+6. **Observability emit** — one **tracelens-style trace event** per request
+   (model, latency_ms, tokens, cost, eval_score, passed) to a pluggable sink;
+   default appends JSONL, a webhook sink can feed a live **tracelens** (v0.2).
+7. **Metrics** — `GET /metrics` returns total requests, tokens, est cost,
    **estimated savings vs always-premium**, avg eval score, and quality-bar pass
    rate.
 
@@ -77,6 +85,67 @@ Maps quality tiers to ordered candidate models with per-1K-token costs, sets the
 
 ---
 
+## What's new in v0.2 — closing the *gate → observe → govern* loop
+
+routerai is the **govern** plane; v0.2 wires it directly to the other two legs so
+a routing change is *proven* (gate), *measured* (observe), and *acted on* (govern)
+end to end.
+
+### 1. Real provider adapters (stub stays the default)
+
+| `ROUTERAI_PROVIDER` | Needs | Notes |
+| --- | --- | --- |
+| `stub` *(default)* | nothing | deterministic, offline, key-free |
+| `openai` | `openai` lib + `OPENAI_API_KEY` | keys read from env, never hardcoded |
+| `anthropic` | `anthropic` lib + `ANTHROPIC_API_KEY` | keys read from env, never hardcoded |
+
+Real adapters are **import-guarded** (the lib is only imported when selected),
+enforce a **timeout** (`ROUTERAI_PROVIDER_TIMEOUT`), do **one retry**
+(`ROUTERAI_PROVIDER_RETRIES`), and **gracefully fall back to the stub** on any
+error — the completion is then tagged `provider="stub"` so the trace tells the truth.
+
+### 2. Persistence (SQLite + in-memory, reload on startup)
+
+Every routing decision (model, tokens, cost, eval score, pass/fail, timestamp) is
+appended to `routerai.db` **and** kept in the in-memory metrics view. On startup
+the app **reloads the aggregate from the log**, so `/metrics` survives restarts.
+Override the path with `ROUTERAI_DB`.
+
+### 3. Observability emit — feeds **tracelens**
+
+One structured **trace event** per request, matching the tracelens trace schema:
+
+```json
+{"request_id":"req-ab12cd34","ts":1751328000.0,"tier":"cheap","model":"stub-small",
+ "provider":"stub","latency_ms":0.42,"prompt_tokens":6,"completion_tokens":34,
+ "total_tokens":40,"cost":8e-06,"baseline_cost":0.0002,"eval_score":0.71,"passed":true}
+```
+
+The sink is pluggable via `ROUTERAI_SINK`:
+
+- `jsonl` *(default)* — append one JSON line to `events.jsonl`
+  (`ROUTERAI_EVENTS_PATH`); tail-able, trivially ingestible.
+- `webhook` — POST each event to `ROUTERAI_WEBHOOK_URL` (feed a live **tracelens**).
+- `null` — disable emit.
+
+A sink failure never breaks the request path.
+
+### 4. CI policy-gate (mirrors **evalstack**)
+
+`.github/workflows/eval-gate.yml` runs the test suite then the eval gate, and
+**fails the build** if the quality-bar pass-rate or estimated savings regresses
+past a threshold — so a policy change that quietly degrades quality/savings can't
+merge:
+
+```bash
+python scripts/eval_gate.py --min-pass-rate 0.8 --min-savings-pct 20 --json
+```
+
+Thresholds also read from `ROUTERAI_MIN_PASS_RATE` / `ROUTERAI_MIN_SAVINGS_PCT`.
+The gate runs against the deterministic stub, so it's stable and key-free in CI.
+
+---
+
 ## Tests
 
 ```bash
@@ -85,13 +154,11 @@ pytest -q
 
 ---
 
-## Roadmap (v0.2+)
+## Roadmap (v0.3+)
 
-- Real OpenAI/Anthropic providers wired end-to-end (stub is the default today).
-- Fine-tuned complexity classifier trained on the decision log.
+- Fine-tuned complexity classifier trained on the persisted decision log.
 - Semantic caching (return cached answers for near-duplicate prompts).
-- Persist the decision log (Postgres) + emit events to **tracelens**.
-- CI policy gate: a routing change that regresses shadow-eval quality fails the build.
+- Postgres persistence backend (SQLite is the default today).
 - Next.js playground + savings dashboard at `routerai.kartikaneja.com`.
 - Latency-SLO-aware routing; per-tenant policies.
 

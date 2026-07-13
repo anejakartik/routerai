@@ -1,0 +1,43 @@
+name: eval-gate
+
+# The govern-plane's CI gate (mirrors evalstack): run the test suite, then run
+# the routing eval policy-gate. A routing/policy change that regresses the
+# quality-bar pass-rate or the estimated savings past threshold FAILS the build.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  eval-gate:
+    runs-on: ubuntu-latest
+    env:
+      # deterministic, key-free: the gate runs against the stub provider.
+      ROUTERAI_PROVIDER: stub
+      # regression thresholds — tighten these as the policy matures.
+      ROUTERAI_MIN_PASS_RATE: "0.8"
+      ROUTERAI_MIN_SAVINGS_PCT: "20"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Eval policy-gate (quality + savings regression check)
+        run: |
+          python scripts/eval_gate.py \
+            --min-pass-rate "$ROUTERAI_MIN_PASS_RATE" \
+            --min-savings-pct "$ROUTERAI_MIN_SAVINGS_PCT" \
+            --json

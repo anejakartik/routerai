@@ -1,16 +1,28 @@
 """Provider abstraction.
 
-A `Provider` turns a chat request into a completion. v0.1 ships a deterministic
-STUB provider so the gateway runs with NO API key. Real providers (OpenAI /
-Anthropic) can drop in behind an env key; `get_provider()` selects based on
+A `Provider` turns a chat request into a completion. routerai ships a
+deterministic STUB provider so the gateway runs with NO API key. Real providers
+(OpenAI / Anthropic) drop in behind an env key; `get_provider()` selects based on
 ROUTERAI_PROVIDER (default: "stub").
+
+v0.2: the real adapters are wired end-to-end (import-guarded so the stub path
+never needs the dependency). Each real adapter enforces a request **timeout**,
+does **one retry**, and on any failure **falls back gracefully to the stub** so a
+provider outage degrades to offline mode instead of a 500.
 """
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from dataclasses import dataclass
-from typing import List, Protocol
+from typing import List, Optional, Protocol
+
+logger = logging.getLogger("routerai.providers")
+
+# defaults; all overridable via env so nothing is hardcoded to a secret.
+DEFAULT_TIMEOUT_S = float(os.getenv("ROUTERAI_PROVIDER_TIMEOUT", "30"))
+DEFAULT_RETRIES = int(os.getenv("ROUTERAI_PROVIDER_RETRIES", "1"))
 
 
 @dataclass
@@ -24,6 +36,9 @@ class Completion:
     text: str
     prompt_tokens: int
     completion_tokens: int
+    # which provider actually produced this (may differ from the configured one
+    # if we fell back to the stub on error).
+    provider: str = "stub"
 
     @property
     def total_tokens(self) -> int:
@@ -71,37 +86,141 @@ class StubProvider:
             text=text,
             prompt_tokens=prompt_tokens,
             completion_tokens=_estimate_tokens(text),
+            provider=self.name,
         )
 
 
-class OpenAIProvider:
-    """Placeholder real provider. Requires `openai` + OPENAI_API_KEY.
+# shared stub instance used for fallback
+_STUB = StubProvider()
 
-    Intentionally lazy-imported so the stub path never needs the dependency.
+
+class _RealProvider:
+    """Base for real network providers: timeout + one retry + stub fallback.
+
+    Subclasses implement `_call(model, messages) -> Completion`. The base handles
+    retries and the graceful degrade so a provider hiccup never 500s the gateway.
+    """
+
+    name = "real"
+
+    def __init__(self, timeout: float = DEFAULT_TIMEOUT_S, retries: int = DEFAULT_RETRIES):
+        self.timeout = timeout
+        self.retries = max(0, retries)
+
+    def _call(self, model: str, messages: List[Message]) -> Completion:  # pragma: no cover
+        raise NotImplementedError
+
+    def complete(self, model: str, messages: List[Message]) -> Completion:
+        attempts = self.retries + 1
+        last_err: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._call(model, messages)
+            except Exception as err:  # noqa: BLE001 - degrade on any provider error
+                last_err = err
+                logger.warning(
+                    "provider %s attempt %d/%d failed: %s",
+                    self.name, attempt, attempts, err,
+                )
+        logger.error(
+            "provider %s exhausted %d attempt(s); falling back to stub (last error: %s)",
+            self.name, attempts, last_err,
+        )
+        # graceful fallback: still serve a deterministic answer, tagged as stub.
+        return _STUB.complete(model, messages)
+
+
+class OpenAIProvider(_RealProvider):
+    """Real OpenAI adapter. Requires `openai` + OPENAI_API_KEY (read from env).
+
+    Lazy-imports `openai` so the stub path never needs the dependency.
     """
 
     name = "openai"
 
-    def complete(self, model: str, messages: List[Message]) -> Completion:  # pragma: no cover
-        from openai import OpenAI  # type: ignore
+    def _call(self, model: str, messages: List[Message]) -> Completion:
+        from openai import OpenAI  # type: ignore  # lazy import
 
-        client = OpenAI()
+        # OpenAI() reads OPENAI_API_KEY from the environment; never hardcoded.
+        client = OpenAI(timeout=self.timeout, max_retries=0)
         resp = client.chat.completions.create(
             model=model,
             messages=[{"role": m.role, "content": m.content} for m in messages],
         )
-        choice = resp.choices[0].message.content or ""
-        usage = resp.usage
+        text = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
         return Completion(
-            text=choice,
-            prompt_tokens=getattr(usage, "prompt_tokens", _estimate_tokens("".join(m.content for m in messages))),
-            completion_tokens=getattr(usage, "completion_tokens", _estimate_tokens(choice)),
+            text=text,
+            prompt_tokens=prompt_tokens if prompt_tokens is not None
+            else sum(_estimate_tokens(m.content) for m in messages),
+            completion_tokens=completion_tokens if completion_tokens is not None
+            else _estimate_tokens(text),
+            provider=self.name,
         )
+
+
+class AnthropicProvider(_RealProvider):
+    """Real Anthropic adapter. Requires `anthropic` + ANTHROPIC_API_KEY (from env).
+
+    Lazy-imports `anthropic`. The routed model id is forwarded as-is; override the
+    fallback default via ROUTERAI_ANTHROPIC_MODEL if a route emits a non-Anthropic
+    id. max_tokens is bounded (ROUTERAI_ANTHROPIC_MAX_TOKENS, default 1024).
+    """
+
+    name = "anthropic"
+
+    def _call(self, model: str, messages: List[Message]) -> Completion:
+        import anthropic  # type: ignore  # lazy import
+
+        # Anthropic() reads ANTHROPIC_API_KEY from the environment; never hardcoded.
+        client = anthropic.Anthropic(timeout=self.timeout, max_retries=0)
+
+        # Anthropic wants a system string separate from the message turns.
+        system = "\n".join(m.content for m in messages if m.role == "system")
+        turns = [
+            {"role": m.role, "content": m.content}
+            for m in messages
+            if m.role in ("user", "assistant")
+        ]
+        max_tokens = int(os.getenv("ROUTERAI_ANTHROPIC_MAX_TOKENS", "1024"))
+        model_id = model or os.getenv("ROUTERAI_ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+
+        kwargs = {"model": model_id, "max_tokens": max_tokens, "messages": turns}
+        if system:
+            kwargs["system"] = system
+        resp = client.messages.create(**kwargs)
+
+        # concatenate any text blocks in the response content
+        text = "".join(
+            getattr(block, "text", "") for block in getattr(resp, "content", [])
+        )
+        usage = getattr(resp, "usage", None)
+        prompt_tokens = getattr(usage, "input_tokens", None)
+        completion_tokens = getattr(usage, "output_tokens", None)
+        return Completion(
+            text=text,
+            prompt_tokens=prompt_tokens if prompt_tokens is not None
+            else sum(_estimate_tokens(m.content) for m in messages),
+            completion_tokens=completion_tokens if completion_tokens is not None
+            else _estimate_tokens(text),
+            provider=self.name,
+        )
+
+
+_PROVIDERS = {
+    "stub": StubProvider,
+    "openai": OpenAIProvider,
+    "anthropic": AnthropicProvider,
+}
 
 
 def get_provider(name: str | None = None) -> Provider:
     """Select a provider. Defaults to the stub so the app runs key-free."""
     name = (name or os.getenv("ROUTERAI_PROVIDER") or "stub").lower()
-    if name == "openai":
-        return OpenAIProvider()
-    return StubProvider()
+    factory = _PROVIDERS.get(name)
+    if factory is None:
+        logger.warning("unknown ROUTERAI_PROVIDER=%r; using stub", name)
+        return _STUB
+    return factory()

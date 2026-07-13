@@ -12,3 +12,6 @@ env/
 htmlcov/
 dist/
 build/
+# routerai runtime artifacts (v0.2)
+routerai.db
+events.jsonl

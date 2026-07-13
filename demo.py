@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from app.config import get_policy
 from app.metrics import STORE
-from app.providers import Message
-from app.routing import route
+from app.observability import get_sink
+from app.providers import Message, get_provider
+from app.routing import get_db, route
 
 SAMPLE_PROMPTS = [
     ("Classify the sentiment of: 'I love this!'", None),          # short -> cheap
@@ -28,7 +29,9 @@ def main() -> None:
     policy = get_policy()
 
     print("=" * 78)
-    print("routerai v0.1 demo — stub provider, no API key needed")
+    print("routerai v0.2 demo — stub provider, no API key needed")
+    print(f"provider   : {get_provider().name}   event sink: "
+          f"{getattr(get_sink(), 'name', 'unknown')}")
     print(f"baseline (always-premium) model: {policy.baseline} "
           f"@ ${policy.cost_per_1k(policy.baseline):.4f}/1K tokens")
     print(f"quality bar: {policy.quality_bar}")
@@ -60,6 +63,15 @@ def main() -> None:
     print(f"\n==> routerai saved an estimated {summary['savings_pct_vs_premium']}% "
           f"vs always using {policy.baseline}, "
           f"pass rate {summary['quality_bar_pass_rate']}.")
+
+    # v0.2: decisions were also persisted to SQLite and one trace event per
+    # request was emitted to the sink (feeds tracelens).
+    try:
+        print(f"==> persisted {get_db().count()} decision(s) to the durable log "
+              f"(routerai.db); trace events emitted via the "
+              f"'{getattr(get_sink(), 'name', 'unknown')}' sink.")
+    except Exception:  # pragma: no cover - demo cosmetics only
+        pass
 
 
 if __name__ == "__main__":

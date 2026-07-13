@@ -9,6 +9,7 @@ Given a chat request, it:
 """
 from __future__ import annotations
 
+import time
 import uuid
 from dataclasses import dataclass
 from typing import List, Optional
@@ -16,7 +17,26 @@ from typing import List, Optional
 from .config import Policy, get_policy
 from .evaluator import evaluate
 from .metrics import STORE, Decision
+from .observability import TraceEvent, emit_event, now_ms
+from .persistence import SQLiteStore
 from .providers import Completion, Message, Provider, get_provider
+
+# durable decision log (SQLite). Lazily created so importing the module never
+# touches the filesystem until the first decision is recorded.
+_DB: Optional[SQLiteStore] = None
+
+
+def get_db() -> SQLiteStore:
+    global _DB
+    if _DB is None:
+        _DB = SQLiteStore()
+    return _DB
+
+
+def set_db(db: Optional[SQLiteStore]) -> None:
+    """Override the durable store (tests point this at a temp DB, or None to skip)."""
+    global _DB
+    _DB = db
 
 # tiers a caller may request explicitly via the `quality_tier` field / model hint
 _KNOWN_TIER_HINTS = {"cheap", "balanced", "premium"}
@@ -79,7 +99,9 @@ def route(
     tier = _resolve_tier(quality_tier, messages, policy)
     chosen_model = policy.cheapest(tier)
 
+    started = now_ms()
     completion = provider.complete(chosen_model, messages)
+    latency_ms = round(now_ms() - started, 3)
 
     # cost is per 1K tokens
     est_cost = policy.cost_per_1k(chosen_model) * completion.total_tokens / 1000.0
@@ -96,17 +118,40 @@ def route(
         eval_score = evaluate(prompt_text, completion.text)
         passed = eval_score >= policy.quality_bar
 
-    STORE.record(
-        Decision(
+    decision = Decision(
+        request_id=request_id,
+        tier=tier,
+        chosen_model=chosen_model,
+        baseline_model=policy.baseline,
+        total_tokens=completion.total_tokens,
+        est_cost=round(est_cost, 8),
+        baseline_cost=round(baseline_cost, 8),
+        eval_score=eval_score,
+        passed_quality_bar=passed,
+    )
+
+    # in-memory hot path (metrics) + durable log (survives restart)
+    STORE.record(decision)
+    db = get_db()
+    if db is not None:
+        db.record(decision)
+
+    # observability: emit one tracelens-style trace per request
+    emit_event(
+        TraceEvent(
             request_id=request_id,
+            ts=time.time(),
             tier=tier,
-            chosen_model=chosen_model,
-            baseline_model=policy.baseline,
+            model=chosen_model,
+            provider=completion.provider,
+            latency_ms=latency_ms,
+            prompt_tokens=completion.prompt_tokens,
+            completion_tokens=completion.completion_tokens,
             total_tokens=completion.total_tokens,
-            est_cost=round(est_cost, 8),
+            cost=round(est_cost, 8),
             baseline_cost=round(baseline_cost, 8),
             eval_score=eval_score,
-            passed_quality_bar=passed,
+            passed=passed,
         )
     )
 
