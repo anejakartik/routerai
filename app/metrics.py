@@ -22,6 +22,7 @@ class Decision:
     baseline_cost: float
     eval_score: float | None
     passed_quality_bar: bool | None
+    fallback: bool = False
 
 
 @dataclass
@@ -56,6 +57,8 @@ class MetricsStore:
         n_passed = sum(1 for d in decisions if d.passed_quality_bar)
         n_evaluated = sum(1 for d in decisions if d.passed_quality_bar is not None)
 
+        n_fallback = sum(1 for d in decisions if d.fallback)
+
         by_model: Dict[str, int] = {}
         for d in decisions:
             by_model[d.chosen_model] = by_model.get(d.chosen_model, 0) + 1
@@ -71,6 +74,10 @@ class MetricsStore:
             "quality_bar_pass_rate": (
                 round(n_passed / n_evaluated, 4) if n_evaluated else None
             ),
+            # requests the stub answered because the routed provider failed;
+            # excluded from cost, savings and pass rate above
+            "fallback_count": n_fallback,
+            "fallback_rate": round(n_fallback / total_requests, 4) if total_requests else 0.0,
             "requests_by_model": by_model,
             "recent_decisions": [asdict(d) for d in decisions[-10:]],
         }

@@ -16,7 +16,7 @@ import hashlib
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional, Protocol
+from typing import Dict, List, Optional, Protocol
 
 logger = logging.getLogger("routerai.providers")
 
@@ -185,7 +185,7 @@ class AnthropicProvider(_RealProvider):
             if m.role in ("user", "assistant")
         ]
         max_tokens = int(os.getenv("ROUTERAI_ANTHROPIC_MAX_TOKENS", "1024"))
-        model_id = model or os.getenv("ROUTERAI_ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
+        model_id = model or os.getenv("ROUTERAI_ANTHROPIC_MODEL", "claude-opus-5-5")
 
         kwargs = {"model": model_id, "max_tokens": max_tokens, "messages": turns}
         if system:
@@ -224,3 +224,23 @@ def get_provider(name: str | None = None) -> Provider:
         logger.warning("unknown ROUTERAI_PROVIDER=%r; using stub", name)
         return _STUB
     return factory()
+
+
+def get_providers(spec: str | None = None) -> Dict[str, Provider]:
+    """Enabled providers keyed by name, from a comma list (ROUTERAI_PROVIDER).
+
+    `ROUTERAI_PROVIDER=openai,anthropic` enables both; the router then picks the
+    cheapest candidate either one can serve and dispatches to its owner.
+    Unknown names are skipped with a warning; an empty result means stub.
+    """
+    spec = spec or os.getenv("ROUTERAI_PROVIDER") or "stub"
+    enabled: Dict[str, Provider] = {}
+    for name in (part.strip().lower() for part in spec.split(",")):
+        if not name:
+            continue
+        factory = _PROVIDERS.get(name)
+        if factory is None:
+            logger.warning("unknown provider %r in ROUTERAI_PROVIDER; skipping", name)
+            continue
+        enabled[name] = factory()
+    return enabled or {"stub": _STUB}

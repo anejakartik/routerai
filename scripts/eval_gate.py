@@ -75,6 +75,7 @@ def run_eval() -> dict:
                 baseline_cost=result.baseline_cost,
                 eval_score=result.eval_score,
                 passed_quality_bar=result.passed_quality_bar,
+                fallback=result.fallback,
             )
         )
     for d in decisions:
@@ -94,12 +95,18 @@ def main(argv=None) -> int:
         default=float(os.getenv("ROUTERAI_MIN_SAVINGS_PCT", "20")),
         help="Fail if estimated savings vs premium is below this (percent).",
     )
+    parser.add_argument(
+        "--max-fallback-rate", type=float,
+        default=float(os.getenv("ROUTERAI_MAX_FALLBACK_RATE", "0")),
+        help="Fail if more than this fraction of requests fell back to the stub.",
+    )
     parser.add_argument("--json", action="store_true", help="Emit the summary as JSON.")
     args = parser.parse_args(argv)
 
     summary = run_eval()
     pass_rate = summary["quality_bar_pass_rate"] or 0.0
     savings_pct = summary["savings_pct_vs_premium"] or 0.0
+    fallback_rate = summary["fallback_rate"]
 
     failures = []
     if pass_rate < args.min_pass_rate:
@@ -111,6 +118,11 @@ def main(argv=None) -> int:
             f"savings {savings_pct:.2f}% < min {args.min_savings_pct:.2f}%"
         )
 
+    if fallback_rate > args.max_fallback_rate:
+        failures.append(
+            f"fallback-rate {fallback_rate:.3f} > max {args.max_fallback_rate:.3f}"
+        )
+
     if args.json:
         print(json.dumps(
             {
@@ -118,6 +130,7 @@ def main(argv=None) -> int:
                 "thresholds": {
                     "min_pass_rate": args.min_pass_rate,
                     "min_savings_pct": args.min_savings_pct,
+                    "max_fallback_rate": args.max_fallback_rate,
                 },
                 "failures": failures,
                 "gate": "FAIL" if failures else "PASS",
@@ -131,6 +144,7 @@ def main(argv=None) -> int:
         print(f"  requests         : {summary['total_requests']}")
         print(f"  pass_rate        : {pass_rate:.3f}  (min {args.min_pass_rate})")
         print(f"  savings_pct      : {savings_pct:.2f}%  (min {args.min_savings_pct}%)")
+        print(f"  fallback_rate    : {fallback_rate:.3f}  (max {args.max_fallback_rate})")
         print(f"  avg_eval_score   : {summary['avg_eval_score']}")
         print("=" * 70)
 

@@ -4,8 +4,13 @@
 # models. The router picks the CHEAPEST candidate whose tier matches the request,
 # then (in shadow mode) checks that the cheap route still clears the quality bar.
 #
-# cost is expressed in USD per 1K tokens (rough public list-price approximations;
-# override freely for your own contracts).
+# cost is expressed in USD per 1K tokens, as a single blended rate applied to
+# prompt + completion tokens (rough list-price approximations; override freely
+# for your own contracts and input/output mix).
+#
+# Every model names the provider that serves it. The router only picks a
+# candidate whose provider is enabled (ROUTERAI_PROVIDER), so a stub or Claude
+# model id is never sent to OpenAI and vice versa.
 #
 # The `baseline` model is what a naive "always use the premium model" setup would
 # have used — used to compute estimated savings on /metrics.
@@ -21,26 +26,31 @@ quality_bar: 0.5
 shadow_sample_rate: 1.0
 
 models:
-  # model_name: cost per 1K tokens (USD)
-  gpt-4o: 0.0050
-  gpt-4o-mini: 0.0003
-  claude-3-5-sonnet: 0.0060
-  claude-3-5-haiku: 0.0010
-  stub-small: 0.0002
-  stub-large: 0.0040
+  # name: {provider, cost per 1K tokens (USD)}
+  gpt-4o:            {provider: openai,    cost: 0.0050}
+  gpt-4o-mini:       {provider: openai,    cost: 0.0003}
+  # Claude: blended 1:1 from $/MTok list prices (in/out) — Haiku 4.5 $1/$5,
+  # Sonnet 5.5 $2/$10, Opus 5.5 $4/$20.
+  claude-haiku-4-5:  {provider: anthropic, cost: 0.0030}
+  claude-sonnet-5-5: {provider: anthropic, cost: 0.0060}
+  claude-opus-5-5:   {provider: anthropic, cost: 0.0120}
+  stub-small:        {provider: stub,      cost: 0.0002}
+  stub-large:        {provider: stub,      cost: 0.0040}
 
-# quality tier -> ordered candidate models (router picks the cheapest of these)
+# quality tier -> candidate models (router picks the cheapest one an enabled
+# provider can serve)
 tiers:
   cheap:
     - stub-small
     - gpt-4o-mini
+    - claude-haiku-4-5
   balanced:
     - stub-small
     - gpt-4o-mini
-    - claude-3-5-haiku
+    - claude-haiku-4-5
   premium:
     - stub-large
-    - claude-3-5-sonnet
+    - claude-sonnet-5-5
     - gpt-4o
 
 # fallback tier used when the request does not specify one (see routing.classify)

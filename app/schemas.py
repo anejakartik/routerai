@@ -43,6 +43,8 @@ class RouterAIMeta(BaseModel):
     est_savings_usd: float
     eval_score: Optional[float] = None
     passed_quality_bar: Optional[bool] = None
+    # the routed provider failed and the offline stub answered instead
+    fallback: bool = False
 
 
 class ChatCompletionResponse(BaseModel):

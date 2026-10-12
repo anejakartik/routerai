@@ -2,7 +2,7 @@
 
 routerai emits exactly one structured **trace event** per request. The schema is
 the tracelens-style trace so the event can be shipped straight to
-[tracelens](https://github.com/kartikaneja): model, latency_ms, tokens, cost,
+[tracelens](https://github.com/anejakartik): model, latency_ms, tokens, cost,
 eval_score, passed.
 
 The sink is pluggable behind an `EventSink` protocol:
@@ -46,6 +46,7 @@ class TraceEvent:
     baseline_cost: float
     eval_score: Optional[float]
     passed: Optional[bool]
+    fallback: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))

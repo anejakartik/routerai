@@ -10,7 +10,7 @@ from __future__ import annotations
 from app.config import get_policy
 from app.metrics import STORE
 from app.observability import get_sink
-from app.providers import Message, get_provider
+from app.providers import Message, get_providers
 from app.routing import get_db, route
 
 SAMPLE_PROMPTS = [
@@ -29,8 +29,8 @@ def main() -> None:
     policy = get_policy()
 
     print("=" * 78)
-    print("routerai v0.2 demo — stub provider, no API key needed")
-    print(f"provider   : {get_provider().name}   event sink: "
+    print("routerai v0.3 demo — stub provider, no API key needed")
+    print(f"providers  : {', '.join(sorted(get_providers()))}   event sink: "
           f"{getattr(get_sink(), 'name', 'unknown')}")
     print(f"baseline (always-premium) model: {policy.baseline} "
           f"@ ${policy.cost_per_1k(policy.baseline):.4f}/1K tokens")

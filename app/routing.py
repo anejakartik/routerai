@@ -9,17 +9,18 @@ Given a chat request, it:
 """
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .config import Policy, get_policy
 from .evaluator import evaluate
 from .metrics import STORE, Decision
 from .observability import TraceEvent, emit_event, now_ms
 from .persistence import SQLiteStore
-from .providers import Completion, Message, Provider, get_provider
+from .providers import Completion, Message, Provider, get_providers
 
 # durable decision log (SQLite). Lazily created so importing the module never
 # touches the filesystem until the first decision is recorded.
@@ -76,6 +77,9 @@ class RouteResult:
     baseline_cost: float
     eval_score: Optional[float]
     passed_quality_bar: Optional[bool]
+    # True when the routed provider failed and the stub answered instead. Such a
+    # request is not a quality signal and not a saving, so it is excluded from both.
+    fallback: bool = False
 
 
 def _resolve_tier(requested: Optional[str], messages: List[Message], policy: Policy) -> str:
@@ -93,19 +97,30 @@ def route(
     request_id: Optional[str] = None,
 ) -> RouteResult:
     policy = policy or get_policy()
-    provider = provider or get_provider()
+    providers: Dict[str, Provider] = (
+        {provider.name: provider} if provider is not None else get_providers()
+    )
     request_id = request_id or f"req-{uuid.uuid4().hex[:8]}"
 
     tier = _resolve_tier(quality_tier, messages, policy)
-    chosen_model = policy.cheapest(tier)
+    # only consider models an enabled provider actually serves
+    chosen_model = policy.cheapest(tier, providers=providers.keys())
+    target = providers.get(policy.provider_for(chosen_model) or "") or next(iter(providers.values()))
 
     started = now_ms()
-    completion = provider.complete(chosen_model, messages)
+    completion = target.complete(chosen_model, messages)
     latency_ms = round(now_ms() - started, 3)
 
+    # the real provider failed and the stub answered: don't bill it, don't count
+    # it as a saving, and don't let the stub's text be scored as a quality pass.
+    fallback = completion.provider != target.name
+
     # cost is per 1K tokens
-    est_cost = policy.cost_per_1k(chosen_model) * completion.total_tokens / 1000.0
-    baseline_cost = policy.cost_per_1k(policy.baseline) * completion.total_tokens / 1000.0
+    if fallback:
+        est_cost = baseline_cost = 0.0
+    else:
+        est_cost = policy.cost_per_1k(chosen_model) * completion.total_tokens / 1000.0
+        baseline_cost = policy.cost_per_1k(policy.baseline) * completion.total_tokens / 1000.0
 
     # shadow eval hook
     if do_eval is None:
@@ -113,7 +128,7 @@ def route(
 
     eval_score: Optional[float] = None
     passed: Optional[bool] = None
-    if do_eval:
+    if do_eval and not fallback:
         prompt_text = next((m.content for m in reversed(messages) if m.role == "user"), "")
         eval_score = evaluate(prompt_text, completion.text)
         passed = eval_score >= policy.quality_bar
@@ -128,6 +143,7 @@ def route(
         baseline_cost=round(baseline_cost, 8),
         eval_score=eval_score,
         passed_quality_bar=passed,
+        fallback=fallback,
     )
 
     # in-memory hot path (metrics) + durable log (survives restart)
@@ -152,6 +168,7 @@ def route(
             baseline_cost=round(baseline_cost, 8),
             eval_score=eval_score,
             passed=passed,
+            fallback=fallback,
         )
     )
 
@@ -164,6 +181,7 @@ def route(
         baseline_cost=round(baseline_cost, 8),
         eval_score=eval_score,
         passed_quality_bar=passed,
+        fallback=fallback,
     )
 
 
@@ -172,6 +190,7 @@ def _sample(request_id: str, rate: float) -> bool:
         return False
     if rate >= 1.0:
         return True
-    # deterministic sampling from the request id
-    bucket = (hash(request_id) % 1000) / 1000.0
+    # deterministic sampling from the request id (built-in hash() is salted per
+    # process, so it would sample a different subset after every restart)
+    bucket = int(hashlib.sha256(request_id.encode()).hexdigest()[:8], 16) % 1000 / 1000.0
     return bucket < rate

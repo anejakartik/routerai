@@ -6,8 +6,8 @@ auto-routes each request to the **cheapest model that still clears your quality
 bar** — and proves the savings with shadow evals.
 
 > **The LLM platform trilogy — gate -> observe -> govern:**
-> [**evalstack**](https://github.com/kartikaneja) proves quality (the *gate*),
-> [**tracelens**](https://github.com/kartikaneja) measures cost/latency (the *observe* layer),
+> [**evalstack**](https://github.com/anejakartik/evalstack) proves quality (the *gate*),
+> [**tracelens**](https://github.com/anejakartik/tracelens) measures cost/latency (the *observe* layer),
 > and **routerai** is the **govern** control-plane that *acts* on both at request time.
 
 ---
@@ -58,10 +58,11 @@ eval score).
 1. **Proxy** — `POST /v1/chat/completions` accepts the standard OpenAI request.
 2. **Routing** — a request is assigned a **quality tier** (explicit hint, or a
    heuristic complexity classifier), then the router picks the **cheapest
-   candidate model** for that tier from `routes.yaml`.
+   candidate model that an enabled provider serves** for that tier from
+   `routes.yaml` (v0.3: every model declares its provider).
 3. **Providers** — a pluggable abstraction. Ships with a **stub** provider so it
-   runs offline with no key; set `ROUTERAI_PROVIDER=openai` (+ `OPENAI_API_KEY`)
-   or `ROUTERAI_PROVIDER=anthropic` (+ `ANTHROPIC_API_KEY`) to use a real backend.
+   runs offline with no key; set `ROUTERAI_PROVIDER=openai` (+ `OPENAI_API_KEY`),
+   `anthropic` (+ `ANTHROPIC_API_KEY`), or `openai,anthropic` to route across both.
    Real adapters enforce a timeout, retry once, and **fall back to the stub** on
    error so a provider outage degrades to offline mode instead of a 500 (v0.2).
 4. **Shadow eval** — a pluggable `evaluate(prompt, response) -> score` judge
@@ -79,9 +80,42 @@ eval score).
 
 ### Configuration — `routes.yaml`
 
-Maps quality tiers to ordered candidate models with per-1K-token costs, sets the
+Maps quality tiers to candidate models, each with a provider and a per-1K-token
+cost (`gpt-4o-mini: {provider: openai, cost: 0.0003}`; the legacy `name: cost`
+form still works and means "any provider"), sets the
 `baseline` (always-premium) model for savings math, the `quality_bar`, and the
 `shadow_sample_rate`. Point `ROUTERAI_ROUTES` at your own file to override.
+
+---
+
+## What's new in v0.3 — routing that knows who serves what
+
+v0.2 shipped real OpenAI and Anthropic adapters, but the router picked the
+cheapest model in a tier with no idea which provider served it. With the shipped
+`routes.yaml` the cheapest candidate in every tier was a stub model, so
+`ROUTERAI_PROVIDER=openai` sent `model="stub-small"` to OpenAI on every request.
+It 404'd, retried, fell back to the stub, and the request was still billed at the
+routed price, counted as a saving, and scored as a quality pass. In other words,
+the real providers never answered a request, and an outage looked like a 100%
+pass rate.
+
+- **Provider-aware routing.** Each model in `routes.yaml` names its provider. The
+  router picks the cheapest candidate an *enabled* provider can serve and
+  dispatches to that provider. `ROUTERAI_PROVIDER=openai,anthropic` routes across
+  both. If no candidate in a tier is servable, the API returns `503` with the
+  reason instead of guessing.
+- **Honest fallbacks.** When a real provider fails and the stub answers, the
+  decision is flagged `fallback: true` (in the response, the trace event, the
+  SQLite log and `/metrics`). It is excluded from cost, savings and pass rate, and
+  `/metrics` reports `fallback_count` / `fallback_rate`. The CI gate takes
+  `--max-fallback-rate` (default `0`).
+- **Current model ids.** Claude entries updated to `claude-haiku-4-5`,
+  `claude-sonnet-5-5` and `claude-opus-5-5`.
+- Shadow-eval sampling now hashes the request id with SHA-256. Python's built-in
+  `hash()` is salted per process, so the sampled subset changed on every restart.
+
+Existing `routerai.db` files are migrated in place (a `fallback` column is added
+on startup).
 
 ---
 
@@ -138,7 +172,7 @@ past a threshold — so a policy change that quietly degrades quality/savings ca
 merge:
 
 ```bash
-python scripts/eval_gate.py --min-pass-rate 0.8 --min-savings-pct 20 --json
+python scripts/eval_gate.py --min-pass-rate 0.8 --min-savings-pct 20 --max-fallback-rate 0 --json
 ```
 
 Thresholds also read from `ROUTERAI_MIN_PASS_RATE` / `ROUTERAI_MIN_SAVINGS_PCT`.

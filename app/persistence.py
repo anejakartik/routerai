@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS decisions (
     baseline_cost      REAL NOT NULL,
     eval_score         REAL,
     passed_quality_bar INTEGER,
+    fallback           INTEGER NOT NULL DEFAULT 0,
     created_at         TEXT NOT NULL DEFAULT (datetime('now'))
 );
 """
@@ -58,6 +59,12 @@ class SQLiteStore:
     def _init_schema(self) -> None:
         with self._lock, self._connect() as conn:
             conn.executescript(_SCHEMA)
+            # databases created before the fallback flag existed
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}
+            if "fallback" not in cols:
+                conn.execute(
+                    "ALTER TABLE decisions ADD COLUMN fallback INTEGER NOT NULL DEFAULT 0"
+                )
 
     def record(self, decision: Decision, timestamp: Optional[str] = None) -> None:
         """Persist one decision. `timestamp` optional (defaults to SQLite now())."""
@@ -66,21 +73,7 @@ class SQLiteStore:
                 conn.execute(
                     """INSERT INTO decisions
                        (request_id, tier, chosen_model, baseline_model, total_tokens,
-                        est_cost, baseline_cost, eval_score, passed_quality_bar)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (
-                        decision.request_id, decision.tier, decision.chosen_model,
-                        decision.baseline_model, decision.total_tokens,
-                        decision.est_cost, decision.baseline_cost,
-                        decision.eval_score,
-                        _bool_to_int(decision.passed_quality_bar),
-                    ),
-                )
-            else:
-                conn.execute(
-                    """INSERT INTO decisions
-                       (request_id, tier, chosen_model, baseline_model, total_tokens,
-                        est_cost, baseline_cost, eval_score, passed_quality_bar, created_at)
+                        est_cost, baseline_cost, eval_score, passed_quality_bar, fallback)
                        VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (
                         decision.request_id, decision.tier, decision.chosen_model,
@@ -88,6 +81,23 @@ class SQLiteStore:
                         decision.est_cost, decision.baseline_cost,
                         decision.eval_score,
                         _bool_to_int(decision.passed_quality_bar),
+                        int(decision.fallback),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO decisions
+                       (request_id, tier, chosen_model, baseline_model, total_tokens,
+                        est_cost, baseline_cost, eval_score, passed_quality_bar, fallback,
+                        created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        decision.request_id, decision.tier, decision.chosen_model,
+                        decision.baseline_model, decision.total_tokens,
+                        decision.est_cost, decision.baseline_cost,
+                        decision.eval_score,
+                        _bool_to_int(decision.passed_quality_bar),
+                        int(decision.fallback),
                         timestamp,
                     ),
                 )
@@ -97,7 +107,7 @@ class SQLiteStore:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """SELECT request_id, tier, chosen_model, baseline_model, total_tokens,
-                          est_cost, baseline_cost, eval_score, passed_quality_bar
+                          est_cost, baseline_cost, eval_score, passed_quality_bar, fallback
                    FROM decisions ORDER BY id ASC"""
             ).fetchall()
         return [
@@ -111,6 +121,7 @@ class SQLiteStore:
                 baseline_cost=r["baseline_cost"],
                 eval_score=r["eval_score"],
                 passed_quality_bar=_int_to_bool(r["passed_quality_bar"]),
+                fallback=bool(r["fallback"]),
             )
             for r in rows
         ]

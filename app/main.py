@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from . import __version__
 from .metrics import STORE
 from .observability import get_sink
-from .providers import Message, get_provider
+from .config import NoRouteError
+from .providers import Message, get_providers
 from .routing import get_db, route
 from .schemas import (
     ChatCompletionRequest,
@@ -48,7 +49,7 @@ def root():
     return {
         "name": "routerai",
         "version": __version__,
-        "provider": get_provider().name,
+        "providers": sorted(get_providers()),
         "event_sink": getattr(get_sink(), "name", "unknown"),
         "endpoints": ["/v1/chat/completions", "/metrics", "/health"],
     }
@@ -65,7 +66,11 @@ def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
     # a model hint like "cheap"/"balanced"/"premium" is honored as a tier
     tier_hint = req.quality_tier or req.model
 
-    result = route(messages, quality_tier=tier_hint)
+    try:
+        result = route(messages, quality_tier=tier_hint)
+    except NoRouteError as err:
+        # routes.yaml has no model in this tier for the enabled providers
+        raise HTTPException(status_code=503, detail=str(err)) from err
 
     return ChatCompletionResponse(
         model=result.chosen_model,
@@ -88,6 +93,7 @@ def chat_completions(req: ChatCompletionRequest) -> ChatCompletionResponse:
             est_savings_usd=round(result.baseline_cost - result.est_cost, 8),
             eval_score=result.eval_score,
             passed_quality_bar=result.passed_quality_bar,
+            fallback=result.fallback,
         ),
     )
 
